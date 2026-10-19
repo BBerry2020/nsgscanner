@@ -67,36 +67,51 @@ nsgscanner --interactive                            # menu + live scan
 
 ## Interactive mode
 
-`nsgscanner --interactive` (or `-i`) opens a menu for scanning hosts directly
-connected to the gateway:
-
-1. Press any key to list the neighbours in the ARP table (`ip neigh`, or
-   `/proc/net/arp` when the `ip` command is missing) as `IP (MAC address)`
-   pairs, or press `m` to type a host.
-2. Pick a host by number, then enter the ports and the protocol.
-3. Results appear live as each port is probed, with a progress line and
-   per-state counters. Up to 64 ports every result is listed; above that only
-   open ports are listed and the other states are counted.
-
-`Ctrl+C` during a scan stops it and returns to the menu; `Ctrl+C` at the menu
-exits. `--timeout`, `--workers` and `--banner` apply to every interactive scan.
+`nsgscanner --interactive` (or `-i`) opens a menu of checks:
 
 ```text
-    #  IP               (MAC)                IFACE       STATE
-    1  192.168.55.1     (3c:22:fb:11:22:33)  eth1        STALE
-    2  192.168.55.56    (00:1d:9c:aa:bb:cc)  eth1        REACHABLE
-Select host [1-2], r=refresh, m=manual, Enter=back: 2
+  [Enter] hosts in the ARP table: pick one and scan its ports
+  [p]     ping all hosts of a network
+  [t]     TCP port(s) of your choice on all hosts of a network
+  [m]     type a host and scan its ports
+  Ctrl+C  exit
+```
 
-Target: 192.168.55.56 (00:1d:9c:aa:bb:cc)
-Ports [1-1024]: 502
-Protocol [t]cp / [u]dp (Enter = tcp):
-# target 192.168.55.56 (00:1d:9c:aa:bb:cc) | TCP | 1 port(s) | timeout 1.5s | Ctrl+C stops the scan
-  502/tcp  open              1.2 ms
-# 1/1 scanned | open 1 | 0.00s
+- **`[Enter]` ARP hosts** — lists the neighbours in the ARP table (`ip neigh`,
+  or `/proc/net/arp` when the `ip` command is missing) as `IP (MAC)` pairs.
+  Pick one, enter ports and protocol, and watch the results live.
+- **`[p]` ping all** — choose a network directly connected to the gateway
+  (read from its interfaces with `ip addr`, or `/proc/net/route`) or type any
+  CIDR up to `/16`, then every address is pinged with the system `ping`
+  command. Hosts that answer ARP but block ICMP are listed as `arp-only`.
+- **`[t]` TCP port on all** — same network choice, then the port(s) you pick
+  are checked on every address: `open` means the service is up, `closed` means
+  the host is up but refuses the port; addresses with no answer are only
+  counted.
+- **`[m]`** — type a host and scan its ports.
+
+After `[p]` and `[t]` the hosts found are listed and you can pick one to scan
+its ports. Every run shows results live with a progress line and per-state
+counters; runs above 1024 probes ask for confirmation first.
+
+`Ctrl+C` during a scan or check stops it and returns to the menu; `Ctrl+C` at
+the menu exits. `--timeout`, `--workers` and `--banner` apply to every run.
+
+```text
+> t
+    #  IFACE         NETWORK             HOSTS
+    1  VLAN1         192.168.55.0/24     254     this host: 192.168.55.254
+Select network [1-1], c=custom CIDR, Enter=back: 1
+Ports [22,80,443]: 502
+# TCP 502 on 192.168.55.0/24 | 253 address(es), 253 probe(s) | timeout 1.5s | Ctrl+C stops
+  192.168.55.56     502/tcp  open              1.2 ms  (c0:cd:d6:c3:56:dc)
+  192.168.55.80     502/tcp  closed            0.9 ms  (00:0e:c6:aa:bb:01)
+# 253/253 probes | open 1, closed 1, filtered 251 | 4.02s
+# 1 host(s) with open port(s), 1 up with the port(s) closed
 ```
 
 The ARP table only lists hosts the gateway has exchanged traffic with
-recently; use `m` to scan any other host.
+recently; `[p]` fills it with every host that answers on the network.
 
 ## Options
 
@@ -104,7 +119,7 @@ recently; use `m` to scan any other host.
 |---|---|
 | `host` | Target IP or hostname |
 | `ports` | Single port (`502`), list (`80,443`) or range (`1-1024`) |
-| `-i`, `--interactive` | Interactive menu: pick a host from the ARP table, live scan |
+| `-i`, `--interactive` | Interactive menu: ARP hosts, ping all, TCP port on all, live results |
 | `--proto {tcp,udp}` | Protocol (default: `tcp`) |
 | `--timeout S` | Per-port timeout in seconds (default: `1.5`) |
 | `--workers N` | Parallel scans (default: `100`) |
