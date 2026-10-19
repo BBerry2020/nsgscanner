@@ -1,7 +1,14 @@
 # nsgscanner
 
-A tiny, dependency-free TCP/UDP port scanner in a single Python file. Scan one
-host and one or more ports, pick the protocol, and get clear per-port states.
+A tiny, dependency-free TCP/UDP port scanner in a single Python file, built to
+support troubleshooting performed from **Netskope Smart Gateways (NSG)**,
+formerly **Infiot**. Run it from the gateway to check whether a host:port
+answers, refuses the connection, or is silently dropped along the path.
+
+Scan one host and one or more ports, pick the protocol, and get clear per-port
+states.
+
+> Independent tool, not an official Netskope product.
 
 - **No dependencies** — Python 3.6+ standard library only.
 - **No root** — uses `connect()` / `sendto()`, not raw sockets.
@@ -73,12 +80,15 @@ nsgscanner 192.168.55.56 53 --proto udp             # UDP
 - `open` — connection accepted.
 - `closed` — actively refused (RST).
 - `filtered` — no reply within the timeout (likely dropped by a firewall).
+- `error` — the connection failed for another reason; the errno is printed
+  (e.g. `EHOSTUNREACH (No route to host)`, `ENETUNREACH (Network is unreachable)`).
 
 **UDP** (connectionless, so inherently ambiguous)
 
 - `open` — an application-layer reply was received.
 - `closed` — an ICMP port-unreachable was received.
 - `open|filtered` — no reply (cannot tell open from filtered).
+- `error` — any other socket error, with its errno.
 
 For reliable UDP results against a specific service, replace the probe
 `payload=b"\x00"` in `scan_udp()` with a real service query (e.g. a DNS packet

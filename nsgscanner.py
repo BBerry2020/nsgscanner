@@ -8,6 +8,10 @@
 """
 nsgscanner.py - minimal TCP/UDP scanner for a host and one or more ports.
 
+A tool to support troubleshooting performed from Netskope Smart Gateways
+(NSG), formerly Infiot: check from the gateway whether a host:port answers,
+refuses the connection, or is silently dropped.
+
 Examples:
   python3 nsgscanner.py 192.168.55.56 502
   python3 nsgscanner.py 192.168.55.56 80,443,502 --proto tcp --banner
@@ -18,10 +22,28 @@ Note: use it only against hosts you own or are explicitly authorized to test.
 UDP scanning is inherently ambiguous (connectionless): with no reply you cannot
 tell "open" from "filtered" -> state open|filtered.
 """
-import argparse, socket, sys, time
+import argparse, errno, os, socket, sys, time
 import concurrent.futures as cf
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+
+def _codes(*names):
+    return {getattr(errno, n) for n in names if hasattr(errno, n)}
+
+
+# connect_ex() does NOT raise socket.timeout: when the timeout expires it
+# returns an errno (EAGAIN/EWOULDBLOCK on Linux, WSAEWOULDBLOCK on Windows).
+REFUSED = _codes("ECONNREFUSED", "WSAECONNREFUSED")
+TIMED_OUT = _codes("EAGAIN", "EWOULDBLOCK", "EINPROGRESS", "ETIMEDOUT",
+                   "WSAEWOULDBLOCK", "WSAETIMEDOUT")
+
+
+def errname(code):
+    """errno code -> 'EHOSTUNREACH (No route to host)'."""
+    if not code:
+        return "unknown error"
+    return "%s (%s)" % (errno.errorcode.get(code, code), os.strerror(code))
 
 
 def parse_ports(spec):
@@ -45,7 +67,7 @@ def scan_tcp(ip, port, timeout, grab=False):
     s.settimeout(timeout)
     try:
         t0 = time.time()
-        rc = s.connect_ex((ip, port))          # 0 = connected
+        rc = s.connect_ex((ip, port))          # 0 = connected, else errno
         rtt = (time.time() - t0) * 1000
         if rc == 0:
             banner = ""
@@ -56,18 +78,22 @@ def scan_tcp(ip, port, timeout, grab=False):
                 except OSError:
                     banner = ""
             return ("open", rtt, banner)
-        return ("closed", rtt, "")
+        if rc in REFUSED:
+            return ("closed", rtt, "")          # actively refused (RST)
+        if rc in TIMED_OUT:
+            return ("filtered", None, "")       # no reply (firewall drop)
+        return ("error", rtt, errname(rc))      # e.g. EHOSTUNREACH, ENETUNREACH
     except socket.timeout:
-        return ("filtered", None, "")           # no reply (firewall drop)
+        return ("filtered", None, "")
     except OSError as e:
-        return ("error", None, "errno %s" % e.errno)
+        return ("error", None, errname(e.errno) if e.errno else str(e))
     finally:
         s.close()
 
 
 def scan_udp(ip, port, timeout, payload=b"\x00"):
-    # connect() on the UDP socket makes any ICMP port-unreachable surface
-    # as ConnectionRefusedError -> port "closed".
+    # connect() on the UDP socket makes an ICMP port-unreachable surface as
+    # ConnectionRefusedError (Linux) or ConnectionResetError (Windows).
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
@@ -78,19 +104,20 @@ def scan_udp(ip, port, timeout, payload=b"\x00"):
             return ("open", None, data[:64].hex())          # application reply
         except socket.timeout:
             return ("open|filtered", None, "")              # no reply
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, ConnectionResetError):
             return ("closed", None, "")                     # ICMP unreachable
-        except OSError as e:
-            return ("closed", None, "errno %s" % e.errno)
     except OSError as e:
-        return ("error", None, str(e))
+        return ("error", None, errname(e.errno) if e.errno else str(e))
     finally:
         s.close()
 
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="nsgscanner", description="TCP/UDP scanner against host:port.")
+        prog="nsgscanner",
+        description="TCP/UDP scanner against host:port, to support "
+                    "troubleshooting from Netskope Smart Gateways "
+                    "(NSG, formerly Infiot).")
     ap.add_argument("host", help="target IP or hostname")
     ap.add_argument("ports", help="single port, list (80,443) or range (1-1024)")
     ap.add_argument("--proto", choices=["tcp", "udp"], default="tcp",
@@ -128,15 +155,20 @@ def main():
 
     t0 = time.time()
     results = {}
+    fut = {}
     workers = max(1, min(args.workers, len(ports)))
+    ex = cf.ThreadPoolExecutor(max_workers=workers)
     try:
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            fut = {ex.submit(work, p): p for p in ports}
-            for f in cf.as_completed(fut):
-                results[fut[f]] = f.result()
+        fut = {ex.submit(work, p): p for p in ports}
+        for f in cf.as_completed(fut):
+            results[fut[f]] = f.result()
     except KeyboardInterrupt:
+        for f in fut:
+            f.cancel()
         print("\n# aborted")
-        sys.exit(130)
+        sys.stdout.flush()
+        os._exit(130)       # exit now, don't wait for in-flight probes
+    ex.shutdown()
 
     openc = 0
     for p in ports:
@@ -150,7 +182,7 @@ def main():
             line += "  %6.1f ms" % rtt
         if extra:
             line += "  %s" % extra
-        print(line)
+        print(line.rstrip())
     print("# %d open (or open|filtered) of %d | %.2fs"
           % (openc, len(ports), time.time() - t0))
 
