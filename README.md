@@ -148,8 +148,15 @@ recently; `[p]` fills it with every host that answers on the network.
 On a terminal, scan data (addresses, MACs, states, times) is bold or coloured
 and helper text (hints, `#` notes, legends, table headers) is grey. Colours
 are off when the output is piped or `NO_COLOR` is set, so the one-shot output
-stays script-friendly. Unicode box and block characters are used on UTF-8
-terminals; `--ascii` (or `NSG_ASCII=1`) forces plain ASCII.
+stays script-friendly.
+
+Drawing is plain ASCII unless the terminal itself confirms it decodes UTF-8:
+at start the console prints one accented character and asks the terminal
+where the cursor landed. Only then are Unicode boxes and blocks used, so an
+SSH client set to Latin-1 never shows broken characters. `--ascii` /
+`--unicode` (or `NSG_ASCII=1` / `NSG_UNICODE=1`) force either mode. If you
+see characters like `â` with `--unicode`, set the SSH client to UTF-8 (in
+PuTTY: *Window > Translation > Remote character set: UTF-8*).
 
 ## Options
 
@@ -159,6 +166,7 @@ terminals; `--ascii` (or `NSG_ASCII=1`) forces plain ASCII.
 | `ports` | Single port (`502`), list (`80,443`) or range (`1-1024`) |
 | `-i`, `--interactive` | Interactive console: ARP hosts, ping sweep, TCP sweep, live map |
 | `--ascii` | Plain ASCII drawing (no Unicode box/block characters) |
+| `--unicode` | Unicode drawing without asking the terminal (it must be set to UTF-8) |
 | `--proto {tcp,udp}` | Protocol (default: `tcp`) |
 | `--timeout S` | Per-port timeout in seconds (default: `1.5`) |
 | `--workers N` | Parallel scans (default: `100`) |

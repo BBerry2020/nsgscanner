@@ -27,7 +27,7 @@ import argparse, errno, ipaddress, os, queue, re, select, shutil, socket
 import struct, subprocess, sys, time
 import concurrent.futures as cf
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 DEFAULT_PORTS = "1-1024"      # interactive mode: initial port suggestion
 DEFAULT_NET_PORTS = "22,80,443"   # interactive "TCP sweep" suggestion
@@ -386,12 +386,20 @@ class UI(object):
         self._spin = 0
 
     @classmethod
-    def detect(cls, force_ascii=False):
+    def detect(cls, force_ascii=False, force_unicode=False, probe=False):
+        """Unicode drawing only when Python writes UTF-8 AND the terminal
+        decodes UTF-8: Python's locale says nothing about the SSH client,
+        so the terminal itself is asked (probe=True). Otherwise ASCII."""
         ansi = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
         color = ansi and "NO_COLOR" not in os.environ
         enc = (getattr(sys.stdout, "encoding", None) or "").lower()
-        uni = (ansi and enc.replace("-", "") == "utf8" and not force_ascii
-               and not os.environ.get("NSG_ASCII"))
+        if (not ansi or enc.replace("-", "") != "utf8" or force_ascii
+                or os.environ.get("NSG_ASCII")):
+            uni = False
+        elif force_unicode or os.environ.get("NSG_UNICODE"):
+            uni = True
+        else:
+            uni = probe and terminal_utf8()
         return cls(ansi, color, uni)
 
     # -- styling ---------------------------------------------------------
@@ -553,6 +561,38 @@ def getkey(prompt="", timeout=None):
     ch = data[:1].decode("latin-1")
     print(ch if ch.isprintable() else "")
     return ch.strip()
+
+
+def terminal_utf8(timeout=0.5):
+    """Does the terminal decode UTF-8? Print 'e-acute' (2 bytes in UTF-8)
+    and ask for the cursor position (DSR): column 2 = one character, the
+    terminal decodes UTF-8; column 3 = two Latin-1 characters. No answer
+    counts as 'no', so the safe ASCII drawing is used."""
+    try:
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return False
+    buf = b""
+    try:
+        tty.setcbreak(fd)                     # no echo of the reply
+        sys.stdout.write("\ré\033[6n")
+        sys.stdout.flush()
+        end = time.time() + timeout
+        while not buf.endswith(b"R"):
+            left = end - time.time()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            buf += os.read(fd, 64)
+    except Exception:
+        return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+    m = re.search(br"\033\[(\d+);(\d+)R", buf)
+    return bool(m) and int(m.group(2)) == 2
 
 
 class NoEcho(object):
@@ -1158,7 +1198,7 @@ def pick_result(ui, rows):
 
 
 def interactive(opts):
-    ui = UI.detect(opts.ascii)
+    ui = UI.detect(opts.ascii, opts.unicode, probe=True)
     try:
         __import__("readline")                # line editing for input()
         ui.readline = True
@@ -1236,8 +1276,11 @@ interactive mode (-i / --interactive), main menu:
 display:
   Colours on a terminal: scan data is bold/coloured (addresses, states,
   times), helper text is grey. Colours are off when the output is not a
-  terminal or NO_COLOR is set. Unicode drawing is used on UTF-8 terminals;
-  --ascii (or NSG_ASCII=1) forces plain ASCII.
+  terminal or NO_COLOR is set. Drawing is plain ASCII unless the terminal
+  answers that it decodes UTF-8 (checked at start), then Unicode boxes and
+  blocks are used. --ascii / --unicode (or NSG_ASCII=1 / NSG_UNICODE=1)
+  force either. Broken characters such as 'â' mean the SSH client is not
+  set to UTF-8: switch it to UTF-8 or use --ascii.
 
 port states:
   TCP  open           connection accepted
@@ -1273,8 +1316,13 @@ def main():
                     help="TCP: attempt a banner grab on open ports")
     ap.add_argument("--open-only", action="store_true",
                     help="print open ports only (one-shot scan)")
-    ap.add_argument("--ascii", action="store_true",
-                    help="plain ASCII drawing, no Unicode box/block characters")
+    draw = ap.add_mutually_exclusive_group()
+    draw.add_argument("--ascii", action="store_true",
+                      help="plain ASCII drawing, no Unicode box/block "
+                           "characters")
+    draw.add_argument("--unicode", action="store_true",
+                      help="Unicode drawing without asking the terminal "
+                           "(it must be set to UTF-8)")
     ap.add_argument("--version", action="version",
                     version="nsgscanner " + __version__)
     if len(sys.argv) == 1:                   # no arguments: show the full help
