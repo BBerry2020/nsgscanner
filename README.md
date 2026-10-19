@@ -52,6 +52,9 @@ nsgscanner <host> <ports> [--proto tcp|udp] [--timeout S] [--workers N] [--banne
 nsgscanner --interactive [--proto tcp|udp] [--timeout S] [--workers N] [--banner]
 ```
 
+Run `nsgscanner` with no arguments (or `nsgscanner -h`) for the full help:
+options, examples, the interactive mode workflow and the port states.
+
 ### Examples
 
 ```sh

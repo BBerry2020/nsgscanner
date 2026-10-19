@@ -26,7 +26,7 @@ tell "open" from "filtered" -> state open|filtered.
 import argparse, errno, os, queue, shutil, socket, subprocess, sys, time
 import concurrent.futures as cf
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 DEFAULT_PORTS = "1-1024"      # interactive mode: initial port suggestion
 LIVE_ALL_MAX = 64             # interactive mode: show every result live up to N ports
@@ -408,20 +408,60 @@ def interactive(opts):
 # command line
 # --------------------------------------------------------------------------
 
+HELP_DESCRIPTION = """\
+TCP/UDP port scanner to support troubleshooting performed from
+Netskope Smart Gateways (NSG), formerly Infiot.
+
+Two ways to run it:
+  nsgscanner <host> <ports> [options]   one-shot scan, results at the end
+  nsgscanner -i [options]               interactive menu with live scan"""
+
+HELP_EPILOG = """\
+examples:
+  nsgscanner 192.168.55.56 502                     single TCP port
+  nsgscanner 192.168.55.56 80,443,502 --banner     port list + banner grab
+  nsgscanner 192.168.55.56 1-1024 --open-only      port range, open only
+  nsgscanner 192.168.55.56 53 --proto udp          UDP
+  nsgscanner -i                                    interactive menu
+  nsgscanner -i --timeout 1 --banner               interactive, options
+                                                   applied to every scan
+
+interactive mode (-i / --interactive):
+  1. press any key to list the directly connected hosts from the ARP
+     table (ip neigh, or /proc/net/arp) as IP (MAC), or [m] to type a host
+  2. pick a host by number, then enter the ports and the protocol
+  3. results appear live, with a progress line and per-state counters
+     (above 64 ports only open ports are listed, all states are counted)
+  Ctrl+C stops a running scan; Ctrl+C at the menu exits.
+  The ARP table only lists hosts the gateway talked to recently.
+
+port states:
+  TCP  open           connection accepted
+       closed         actively refused (RST)
+       filtered       no reply within the timeout (firewall drop)
+       error          other failure, errno shown (e.g. EHOSTUNREACH)
+  UDP  open           application reply received
+       closed         ICMP port-unreachable received
+       open|filtered  no reply (cannot tell open from filtered)
+
+Use only against hosts you own or are explicitly authorized to test."""
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="nsgscanner",
-        description="TCP/UDP scanner against host:port, to support "
-                    "troubleshooting from Netskope Smart Gateways "
-                    "(NSG, formerly Infiot).")
+        description=HELP_DESCRIPTION, epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("host", nargs="?", help="target IP or hostname")
     ap.add_argument("ports", nargs="?",
-                    help="single port, list (80,443) or range (1-1024)")
+                    help="single port (502), list (80,443) or range (1-1024)")
     ap.add_argument("-i", "--interactive", action="store_true",
-                    help="interactive menu: pick a host from the ARP table "
-                         "and scan it live (Ctrl+C to exit)")
+                    help="interactive menu: pick a host from the ARP table, "
+                         "choose ports/protocol, watch the scan live "
+                         "(Ctrl+C to exit)")
     ap.add_argument("--proto", choices=["tcp", "udp"], default="tcp",
-                    help="protocol (default: tcp)")
+                    help="protocol (default: tcp; selectable in the menu "
+                         "with -i)")
     ap.add_argument("--timeout", type=float, default=1.5,
                     help="per-port timeout in seconds (default: 1.5)")
     ap.add_argument("--workers", type=int, default=100,
@@ -429,9 +469,12 @@ def main():
     ap.add_argument("--banner", action="store_true",
                     help="TCP: attempt a banner grab on open ports")
     ap.add_argument("--open-only", action="store_true",
-                    help="print open ports only")
+                    help="print open ports only (one-shot scan)")
     ap.add_argument("--version", action="version",
                     version="nsgscanner " + __version__)
+    if len(sys.argv) == 1:                   # no arguments: show the full help
+        ap.print_help()
+        sys.exit(0)
     args = ap.parse_args()
 
     if args.interactive:
