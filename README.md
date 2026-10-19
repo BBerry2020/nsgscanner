@@ -14,6 +14,9 @@ states.
 - **No root** — uses `connect()` / `sendto()`, not raw sockets.
 - **Parallel** — threaded, tunable with `--workers`.
 - **Clear states** — distinguishes `open` / `closed` / `filtered` (and UDP `open|filtered`).
+- **Interactive console** — `-i` opens a menu with a live gateway dashboard,
+  ping and TCP sweeps drawn as a refreshing map of the network, and colours
+  that keep scan data apart from helper text.
 
 > **Authorized use only.** Scan hosts you own or are explicitly permitted to
 > test. You are responsible for how you use this tool.
@@ -67,51 +70,86 @@ nsgscanner --interactive                            # menu + live scan
 
 ## Interactive mode
 
-`nsgscanner --interactive` (or `-i`) opens a menu of checks:
+`nsgscanner --interactive` (or `-i`) opens a console with a live dashboard of
+the gateway (hostname, connected networks, ARP neighbours, clock, refreshed
+every 2 seconds) and a menu of checks:
 
 ```text
-  [Enter] hosts in the ARP table: pick one and scan its ports
-  [p]     ping all hosts of a network
-  [t]     TCP port(s) of your choice on all hosts of a network
-  [m]     type a host and scan its ports
-  Ctrl+C  exit
+   [Enter]  ARP hosts    pick a neighbour and scan its ports
+   [p]      ping sweep   ping every address of a network
+   [t]      TCP sweep    port(s) of your choice on every address
+   [m]      manual host  type a host and scan its ports
+   Ctrl+C   exit
 ```
 
 - **`[Enter]` ARP hosts** — lists the neighbours in the ARP table (`ip neigh`,
   or `/proc/net/arp` when the `ip` command is missing) as `IP (MAC)` pairs.
   Pick one, enter ports and protocol, and watch the results live.
-- **`[p]` ping all** — choose a network directly connected to the gateway
+- **`[p]` ping sweep** — choose a network directly connected to the gateway
   (read from its interfaces with `ip addr`, or `/proc/net/route`) or type any
   CIDR up to `/16`, then every address is pinged with the system `ping`
   command. Hosts that answer ARP but block ICMP are listed as `arp-only`.
-- **`[t]` TCP port on all** — same network choice, then the port(s) you pick
-  are checked on every address: `open` means the service is up, `closed` means
+- **`[t]` TCP sweep** — same network choice, then the port(s) you pick are
+  checked on every address: `open` means the service is up, `closed` means
   the host is up but refuses the port; addresses with no answer are only
   counted.
 - **`[m]`** — type a host and scan its ports.
 
-After `[p]` and `[t]` the hosts found are listed and you can pick one to scan
-its ports. Every run shows results live with a progress line and per-state
-counters; runs above 1024 probes ask for confirmation first.
+Sweeps on networks up to `/22` are drawn as a **live map**, one cell per
+address, redrawn in place as replies arrive, with a progress line, a legend
+and the latest hosts found. After `[p]` and `[t]` the hosts found are listed
+and you can pick one to scan its ports. Runs above 1024 probes ask for
+confirmation first.
 
-`Ctrl+C` during a scan or check stops it and returns to the menu; `Ctrl+C` at
+`Ctrl+C` during a scan or sweep stops it and returns to the menu; `Ctrl+C` at
 the menu exits. `--timeout`, `--workers` and `--banner` apply to every run.
 
 ```text
-> t
-    #  IFACE         NETWORK             HOSTS
-    1  VLAN1         192.168.55.0/24     254     this host: 192.168.55.254
-Select network [1-1], c=custom CIDR, Enter=back: 1
-Ports [22,80,443]: 502
-# TCP 502 on 192.168.55.0/24 | 253 address(es), 253 probe(s) | timeout 1.5s | Ctrl+C stops
-  192.168.55.56     502/tcp  open              1.2 ms  (c0:cd:d6:c3:56:dc)
-  192.168.55.80     502/tcp  closed            0.9 ms  (00:0e:c6:aa:bb:01)
-# 253/253 probes | open 1, closed 1, filtered 251 | 4.02s
-# 1 host(s) with open port(s), 1 up with the port(s) closed
+# ping 192.168.55.0/24 | 253 address(es) | timeout 1s | Ctrl+C stops
+╭─ ping 192.168.55.0/24 ────────────────────────────────────────── VLAN1 ─╮
+│         0               8               16              24              │
+│      .0   █ · · · · · · · · · · █ █ · · · · · · · · · · · · · · · · · · │
+│     .32 · · · · · · · · · · · · · · · · · · · · · · · · █ · · · · · · · │
+│     .64 · · · · · · · · · · · · · █ · · · · · · · · · · · · · · · · · · │
+│     .96 · · · · · █ · · · · · · · · · · · · · · · · · · · · · · · · · · │
+│    .128 · · · · · · · · · · · · · · · · · · · · · · █ · · · · · · · · · │
+│    .160 · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · │
+│    .192 · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · │
+│    .224 · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · @   │
+╰─────────────────────────────────────────────────────────────────────────╯
+ ✓ ████████████████████ 253/253 100% | alive 7, no reply 246 | 4.7s
+ █ alive  · no reply  ░ pending  @ this gateway
+ latest ● 192.168.55.150     0.4 ms
+        ● 192.168.55.77      0.5 ms
+        ● 192.168.55.13      0.4 ms
+        ● 192.168.55.101     0.4 ms
+# 253/253 pinged | alive 7, no reply 246 | 4.66s
+# 1 more host(s) in the ARP table without a ping reply (ICMP blocked?)
+
+ ╭─ Hosts found (8) ──────────────────────────────────────────────────────────────╮
+ │ #  IP              MAC                  RESULT    DETAILS                      │
+ │ 1  192.168.55.1    (3c:22:fb:11:22:33)  alive     0.4 ms                       │
+ │ 2  192.168.55.12                        alive     0.4 ms                       │
+ │ 3  192.168.55.13                        alive     0.4 ms                       │
+ │ 4  192.168.55.56   (c0:cd:d6:c3:56:dc)  alive     0.5 ms                       │
+ │ 5  192.168.55.77                        alive     0.5 ms                       │
+ │ 6  192.168.55.80   (00:0e:c6:aa:bb:01)  arp-only  no ping reply, ARP REACHABLE │
+ │ 7  192.168.55.101                       alive     0.4 ms                       │
+ │ 8  192.168.55.150                       alive     0.4 ms                       │
+ ╰────────────────────────────────────────────────────────────────────────────────╯
+Port-scan a host (1-8, Enter back to the menu):
 ```
 
 The ARP table only lists hosts the gateway has exchanged traffic with
 recently; `[p]` fills it with every host that answers on the network.
+
+### Display
+
+On a terminal, scan data (addresses, MACs, states, times) is bold or coloured
+and helper text (hints, `#` notes, legends, table headers) is grey. Colours
+are off when the output is piped or `NO_COLOR` is set, so the one-shot output
+stays script-friendly. Unicode box and block characters are used on UTF-8
+terminals; `--ascii` (or `NSG_ASCII=1`) forces plain ASCII.
 
 ## Options
 
@@ -119,7 +157,8 @@ recently; `[p]` fills it with every host that answers on the network.
 |---|---|
 | `host` | Target IP or hostname |
 | `ports` | Single port (`502`), list (`80,443`) or range (`1-1024`) |
-| `-i`, `--interactive` | Interactive menu: ARP hosts, ping all, TCP port on all, live results |
+| `-i`, `--interactive` | Interactive console: ARP hosts, ping sweep, TCP sweep, live map |
+| `--ascii` | Plain ASCII drawing (no Unicode box/block characters) |
 | `--proto {tcp,udp}` | Protocol (default: `tcp`) |
 | `--timeout S` | Per-port timeout in seconds (default: `1.5`) |
 | `--workers N` | Parallel scans (default: `100`) |

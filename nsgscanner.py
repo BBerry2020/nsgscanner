@@ -6,7 +6,7 @@
 # See the LICENSE file for the full license text.
 #
 """
-nsgscanner.py - minimal TCP/UDP scanner for a host and one or more ports.
+nsgscanner.py - TCP/UDP scanner and network checks for a host or a network.
 
 A tool to support troubleshooting performed from Netskope Smart Gateways
 (NSG), formerly Infiot: check from the gateway whether a host:port answers,
@@ -17,29 +17,63 @@ Examples:
   python3 nsgscanner.py 192.168.55.56 80,443,502 --proto tcp --banner
   python3 nsgscanner.py 192.168.55.56 1-1024 --proto tcp --timeout 1 --workers 200 --open-only
   python3 nsgscanner.py 192.168.55.56 53 --proto udp
-  python3 nsgscanner.py --interactive    # pick a host from the ARP table, live scan
+  python3 nsgscanner.py --interactive    # menu: ARP hosts, ping/TCP sweep, live
 
 Note: use it only against hosts you own or are explicitly authorized to test.
 UDP scanning is inherently ambiguous (connectionless): with no reply you cannot
 tell "open" from "filtered" -> state open|filtered.
 """
-import argparse, errno, ipaddress, os, queue, re, shutil, socket, struct
-import subprocess, sys, time
+import argparse, errno, ipaddress, os, queue, re, select, shutil, socket
+import struct, subprocess, sys, time
 import concurrent.futures as cf
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 DEFAULT_PORTS = "1-1024"      # interactive mode: initial port suggestion
-DEFAULT_NET_PORTS = "22,80,443"   # interactive "TCP port on all hosts" suggestion
+DEFAULT_NET_PORTS = "22,80,443"   # interactive "TCP sweep" suggestion
 LIVE_ALL_MAX = 64             # interactive mode: show every result live up to N ports
 CONFIRM_ABOVE = 1024          # ask before running more probes than this
-MIN_PREFIX = 16               # largest network accepted for checks on all hosts
+MIN_PREFIX = 16               # largest network accepted for sweeps
+MENU_REFRESH = 2.0            # seconds between main menu refreshes
 
 STATE_ORDER = ("open", "open|filtered", "closed", "filtered", "error")
 PING_ORDER = ("alive", "no reply", "error")
-STATE_COLORS = {"open": "1;32", "open|filtered": "36", "closed": "2",
-                "filtered": "33", "error": "31", "alive": "1;32",
-                "arp-only": "33", "no reply": "2"}
+
+# ANSI colours. Scan data (addresses, states, numbers) is bright/coloured;
+# helper text (hints, '#' notes, legends, table headers) is grey.
+STATE_COLORS = {"open": "1;32", "alive": "1;32", "open|filtered": "36",
+                "closed": "33", "arp-only": "33", "filtered": "35",
+                "no reply": "2", "error": "31"}
+THEME = {"frame": "34", "title": "1;36", "key": "1;33", "help": "90",
+         "prompt": "36", "ip": "1", "mac": "36", "data": "",
+         "logo": ("96", "96", "36", "36", "34")}
+
+LOGO = r"""
+   ____  _________ _______________ _____  ____  ___  _____
+  / __ \/ ___/ __ `/ ___/ ___/ __ `/ __ \/ __ \/ _ \/ ___/
+ / / / (__  ) /_/ (__  ) /__/ /_/ / / / / / / /  __/ /
+/_/ /_/____/\__, /____/\___/\__,_/_/ /_/_/ /_/\___/_/
+           /____/""".strip("\n").splitlines()
+
+GLYPHS = {
+    True: {"h": "─", "v": "│", "tl": "╭", "tr": "╮",
+           "bl": "╰", "br": "╯", "full": "█", "empty": "░",
+           "spin": "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+           "done": "✓", "arrow": "▸", "dot": "●",
+           "cell": {"pending": "░", "alive": "█", "open": "█",
+                    "closed": "▓", "open|filtered": "▒",
+                    "no reply": "·", "filtered": "·", "error": "x",
+                    "self": "@"}},
+    False: {"h": "-", "v": "|", "tl": "+", "tr": "+", "bl": "+", "br": "+",
+            "full": "#", "empty": ".", "spin": "|/-\\", "done": "*",
+            "arrow": ">", "dot": "*",
+            "cell": {"pending": ".", "alive": "#", "open": "#", "closed": "+",
+                     "open|filtered": "?", "no reply": "-", "filtered": "-",
+                     "error": "x", "self": "@"}},
+}
+CELL_RANK = {"pending": 0, "no reply": 1, "filtered": 1, "error": 2,
+             "open|filtered": 3, "closed": 3, "alive": 4, "open": 4}
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 
 
 def _codes(*names):
@@ -207,42 +241,7 @@ def scan_iter(ip, ports, proto, timeout, workers, banner=False, tick=0.25):
 
 
 # --------------------------------------------------------------------------
-# output helpers
-# --------------------------------------------------------------------------
-
-def paint(text, state, color):
-    if color and state in STATE_COLORS:
-        return "\033[%sm%s\033[0m" % (STATE_COLORS[state], text)
-    return text
-
-
-def fmt_line(port, proto, state, rtt, extra, color=False):
-    st = "%-13s" % state if (rtt is not None or extra) else state
-    line = "%5d/%s  %s" % (port, proto, paint(st, state, color))
-    if rtt is not None:
-        line += "  %6.1f ms" % rtt
-    if extra:
-        line += "  %s" % extra
-    return line
-
-
-def fmt_counts(counts, order=STATE_ORDER):
-    return ", ".join("%s %d" % (s, counts[s])
-                     for s in order if counts.get(s)) or "-"
-
-
-def status_text(done, total, counts, t0, order=STATE_ORDER, width=20):
-    fill = width * done // total if total else width
-    txt = "[%s%s] %d/%d %3d%% | %s | %.1fs" % (
-        "#" * fill, "." * (width - fill), done, total,
-        100 * done // total if total else 100, fmt_counts(counts, order),
-        time.time() - t0)
-    cols = shutil.get_terminal_size((80, 24)).columns
-    return txt[:max(10, cols - 1)]           # never wrap, or \r can't redraw it
-
-
-# --------------------------------------------------------------------------
-# interactive mode
+# system information: ARP table, connected networks
 # --------------------------------------------------------------------------
 
 def _ip_key(ip):
@@ -296,6 +295,10 @@ def proc_arp():
     return hosts
 
 
+def mac_of(ip):
+    return proc_arp().get(ip, ("", ""))[1]
+
+
 def local_networks():
     """IPv4 networks directly connected to this system, as a list of
     (dev, own_ip, network). Uses `ip -o -4 addr`, falls back to the
@@ -342,9 +345,191 @@ def local_networks():
     return result
 
 
-def getkey(prompt=""):
-    """Read a single keypress. cbreak mode keeps Ctrl+C (SIGINT) working.
-    Returns '' for Enter/space; falls back to line input without a tty."""
+# --------------------------------------------------------------------------
+# terminal UI: colours, Unicode/ASCII drawing, keys
+# --------------------------------------------------------------------------
+
+def vlen(s):
+    """Visible length of a string (ANSI escapes do not count)."""
+    return len(ANSI_RE.sub("", s))
+
+
+def term_size():
+    return shutil.get_terminal_size((80, 24))
+
+
+def vtrunc(s, n):
+    """Cut s to n visible characters, keeping ANSI escapes intact."""
+    out, vis, i = [], 0, 0
+    while i < len(s) and vis < n:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    if "\033[" in s:
+        out.append("\033[0m")
+    return "".join(out)
+
+
+class UI(object):
+    """Output styling. Without a terminal (pipe, file) everything is plain
+    text, so the one-shot CLI output stays script-friendly."""
+
+    def __init__(self, ansi=False, color=False, uni=False):
+        self.ansi, self.color, self.uni = ansi, color, uni
+        self.g = GLYPHS[uni]
+        self.readline = False
+        self._spin = 0
+
+    @classmethod
+    def detect(cls, force_ascii=False):
+        ansi = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        color = ansi and "NO_COLOR" not in os.environ
+        enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+        uni = (ansi and enc.replace("-", "") == "utf8" and not force_ascii
+               and not os.environ.get("NSG_ASCII"))
+        return cls(ansi, color, uni)
+
+    # -- styling ---------------------------------------------------------
+    def c(self, text, code):
+        if self.color and code:
+            return "\033[%sm%s\033[0m" % (code, text)
+        return text
+
+    def t(self, text, role):
+        return self.c(text, THEME[role])
+
+    def st(self, text, state):
+        return self.c(text, STATE_COLORS.get(state))
+
+    def style(self, text, style):
+        if style in THEME:
+            return self.t(text, style)
+        return self.st(text, style)
+
+    def help(self, text):
+        return self.t(text, "help")
+
+    def info(self, text):
+        print(self.help("# " + text))
+
+    # -- prompts ---------------------------------------------------------
+    def prompt(self, question, hint=""):
+        p = self.t(question, "prompt")
+        if hint:
+            p += " " + self.help("(%s)" % hint)
+        return p + self.t(": ", "prompt")
+
+    def ask(self, question, hint=""):
+        p = self.prompt(question, hint)
+        if self.readline:                     # let readline measure the prompt
+            p = ANSI_RE.sub(lambda m: "\001" + m.group(0) + "\002", p)
+        return input(p).strip()
+
+    def key(self, question, hint=""):
+        return getkey(self.prompt(question, hint)).lower()
+
+    def pause(self):
+        getkey(self.help("press any key to continue "))
+
+    # -- screen ----------------------------------------------------------
+    def clear(self):
+        if self.ansi:
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.flush()
+
+    def cursor(self, show):
+        if self.ansi:
+            sys.stdout.write("\033[?25h" if show else "\033[?25l")
+            sys.stdout.flush()
+
+    def section(self, title):
+        """Clear the screen and print a title bar for a new screen."""
+        self.clear()
+        g = self.g
+        width = min(term_size().columns, 80) - 1
+        head = (self.t(" nsgscanner ", "title") + self.help(g["arrow"]) + " "
+                + self.t(title, "ip") + " ")
+        print(self.t(g["h"] * 2, "frame") + head
+              + self.t(g["h"] * max(2, width - 2 - vlen(head)), "frame"))
+        print()
+
+    def box(self, title, lines, right="", width=0):
+        """Frame lines in a box with a title (and an optional right label)."""
+        g = self.g
+        fr = lambda s: self.t(s, "frame")
+        inner = max([vlen(l) for l in lines] +
+                    [vlen(title) + vlen(right) + 8, width - 4])
+        inner = min(inner, term_size().columns - 7)    # never wrap the frame
+        cut = "…" if self.uni else "~"
+        lines = [l if vlen(l) <= inner else vtrunc(l, inner - 1) + self.help(cut)
+                 for l in lines]
+        total = inner + 4
+        fill = total - 5 - vlen(title) - (vlen(right) + 3 if right else 0)
+        top = fr(g["tl"] + g["h"]) + " " + self.t(title, "title") + " "
+        top += fr(g["h"] * max(1, fill))
+        if right:
+            top += " " + self.help(right) + " " + fr(g["h"])
+        out = [top + fr(g["tr"])]
+        for l in lines:
+            out.append(fr(g["v"]) + " " + l + " " * (inner - vlen(l)) + " "
+                       + fr(g["v"]))
+        out.append(fr(g["bl"] + g["h"] * (total - 2) + g["br"]))
+        return out
+
+    def table(self, headers, rows):
+        """rows: lists of (text, style) cells. ANSI-safe column alignment."""
+        widths = [len(h) for h in headers]
+        for r in rows:
+            for i, (txt, _) in enumerate(r):
+                widths[i] = max(widths[i], len(txt))
+        out = [self.help("  ".join(h.ljust(widths[i])
+                                   for i, h in enumerate(headers)).rstrip())]
+        for r in rows:
+            cells = [self.style(txt.ljust(widths[i]) if i < len(r) - 1 else txt,
+                                style) for i, (txt, style) in enumerate(r)]
+            out.append("  ".join(cells))
+        return out
+
+    # -- progress --------------------------------------------------------
+    def spinner(self):
+        s = self.g["spin"]
+        self._spin += 1
+        return s[self._spin % len(s)]
+
+    def bar(self, done, total, width=20):
+        fill = width * done // total if total else width
+        return (self.c(self.g["full"] * fill, "32")
+                + self.help(self.g["empty"] * (width - fill)))
+
+    def status(self, done, total, counts, t0, order=STATE_ORDER):
+        pct = 100 * done // total if total else 100
+        mark = self.g["done"] if done >= total else self.spinner()
+        cnt = [(s, counts[s]) for s in order if counts.get(s)]
+        txt = "%s %s %s %s %s %s %s" % (
+            self.t(mark, "title"), self.bar(done, total),
+            self.t("%d/%d" % (done, total), "ip"), self.help("%3d%%" % pct),
+            self.help("|"),
+            ", ".join(self.st("%s %d" % sc, sc[0]) for sc in cnt)
+            or self.help("-"),
+            self.help("| %.1fs" % (time.time() - t0)))
+        cols = term_size().columns
+        if vlen(txt) >= cols:                 # never wrap: \r redraw would break
+            txt = ANSI_RE.sub("", txt)[:max(10, cols - 1)]
+        return txt
+
+
+PLAIN = UI()
+
+
+def getkey(prompt="", timeout=None):
+    """Read a single keypress (cbreak mode keeps Ctrl+C working). Returns
+    '' for Enter/space, None when `timeout` expires with no key. Falls back
+    to line input without a terminal."""
     sys.stdout.write(prompt)
     sys.stdout.flush()
     try:
@@ -358,6 +543,8 @@ def getkey(prompt=""):
         return line.strip()[:1]
     try:
         tty.setcbreak(fd)
+        if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+            return None
         data = os.read(fd, 32)                # swallow escape sequences whole
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -368,119 +555,373 @@ def getkey(prompt=""):
     return ch.strip()
 
 
-def manual_host():
+class NoEcho(object):
+    """Turn terminal echo off during a live view (typed keys or ^C would
+    land in the middle of it) and drop anything typed meanwhile."""
+
+    def __enter__(self):
+        self.old = None
+        try:
+            import termios
+            self.termios, self.fd = termios, sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            new = termios.tcgetattr(self.fd)
+            new[3] &= ~termios.ECHO
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, new)
+        except Exception:
+            self.old = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            try:
+                self.termios.tcflush(self.fd, self.termios.TCIFLUSH)
+                self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old)
+            except Exception:
+                pass
+        return False
+
+
+# --------------------------------------------------------------------------
+# live views
+# --------------------------------------------------------------------------
+
+def fmt_line(port, proto, state, rtt, extra, ui=PLAIN):
+    st = "%-13s" % state if (rtt is not None or extra) else state
+    line = ui.t("%5d/%s" % (port, proto), "ip") + "  " + ui.st(st, state)
+    if rtt is not None:
+        line += "  " + ui.t("%6.1f ms" % rtt, "data")
+    if extra:
+        line += "  " + ui.t(extra, "data")
+    return line
+
+
+def fmt_counts(counts, order=STATE_ORDER):
+    return ", ".join("%s %d" % (s, counts[s])
+                     for s in order if counts.get(s)) or "-"
+
+
+class ScrollView(object):
+    """Results printed as lines as they arrive, under a status line."""
+
+    def __init__(self, ui, show, fmt, order):
+        self.ui, self.show, self.fmt, self.order = ui, show, fmt, order
+        self.drawn = False
+
+    def open(self):
+        self.ui.cursor(False)
+
+    def result(self, task, res):
+        if self.show is None or res[0] in self.show:
+            self._clear()
+            print(self.fmt(task, res))
+            return True                       # redraw the status line now
+        return False
+
+    def draw(self, done, total, counts, t0):
+        if self.ui.ansi:
+            sys.stdout.write("\r\033[K" + self.ui.status(done, total, counts,
+                                                         t0, self.order))
+            sys.stdout.flush()
+            self.drawn = True
+
+    def finish(self, done, total, counts, t0):
+        self._clear()
+
+    def close(self):
+        self.ui.cursor(True)
+
+    def _clear(self):
+        if self.drawn:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+            self.drawn = False
+
+
+class GridView(object):
+    """Live map of a network, one cell per address, redrawn in place:
+    cells change as replies arrive, with a progress line, a legend and the
+    latest hosts found."""
+    RECENT = 4
+
+    def __init__(self, ui, title, right, net, own, ip_of, order, legend,
+                 found, fmt_found):
+        self.ui, self.title, self.right, self.net = ui, title, right, net
+        self.ip_of, self.order = ip_of, order
+        self.legend = [l for l in legend if own or l[0] != "self"]
+        self.found, self.fmt_found = found, fmt_found
+        self.base = int(net.network_address)
+        self.n = net.num_addresses
+        self.cols = self._cols()
+        self.rows = -(-self.n // self.cols)
+        self.cell = {int(h) - self.base: "pending" for h in net.hosts()}
+        if own:
+            self.cell[int(ipaddress.ip_address(own)) - self.base] = "self"
+        self.recent = []
+        self.height = 0
+
+    @staticmethod
+    def _cols():
+        return 32 if term_size().columns >= 80 else 16
+
+    @classmethod
+    def fits(cls, net):
+        size = term_size()
+        cols = cls._cols()
+        rows = -(-net.num_addresses // cols)
+        return (net.num_addresses <= 1024 and size.columns >= cols * 2 + 14
+                and rows + 7 + cls.RECENT <= size.lines - 1)
+
+    def glyph(self, state):
+        ch = self.ui.g["cell"].get(state, " ")
+        if state == "pending":
+            return self.ui.help(ch)
+        if state == "self":
+            return self.ui.t(ch, "title")
+        return self.ui.st(ch, state)
+
+    def open(self):
+        self.ui.cursor(False)
+
+    def result(self, task, res):
+        ip = self.ip_of(task)
+        off = int(ipaddress.ip_address(ip)) - self.base
+        cur = self.cell.get(off, "pending")
+        if cur == "pending" or CELL_RANK.get(res[0], 0) > CELL_RANK.get(cur, 0):
+            self.cell[off] = res[0]
+        if res[0] in self.found:
+            self.recent.append(self.fmt_found(task, res))
+        return False
+
+    def render(self, done, total, counts, t0):
+        ui = self.ui
+        ruler = [" "] * (self.cols * 2)
+        for c in range(0, min(self.cols, self.n), 8):
+            ruler[c * 2:c * 2 + len(str(c))] = list(str(c))
+        lines = [ui.help(" " * 8 + "".join(ruler).rstrip())]
+        for r in range(self.rows):
+            first = self.base + r * self.cols
+            if self.net.prefixlen >= 24:
+                label = ".%d" % (first & 255)
+            else:
+                label = "%d.%d" % ((first >> 8) & 255, first & 255)
+            offs = range(r * self.cols, min((r + 1) * self.cols, self.n))
+            cells = " ".join(self.glyph(self.cell[o]) if o in self.cell
+                             else " " for o in offs)
+            lines.append(ui.help(label.rjust(7)) + " " + cells)
+        out = ui.box(self.title, lines, self.right)
+        out.append(" " + ui.status(done, total, counts, t0, self.order))
+        out.append(" " + "  ".join(self.glyph(s) + " " + ui.help(lbl)
+                                   for s, lbl in self.legend))
+        latest = self.recent[::-1][:self.RECENT]
+        for i in range(self.RECENT):
+            head = ui.help("latest " if i == 0 else "       ")
+            out.append(" " + head + (latest[i] if i < len(latest)
+                                     else (ui.help("-") if i == 0 else "")))
+        return out
+
+    def draw(self, done, total, counts, t0):
+        lines = self.render(done, total, counts, t0)
+        buf = ["\033[%dA\r" % self.height] if self.height else []
+        buf += [l + "\033[K\n" for l in lines]
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        self.height = len(lines)
+
+    def finish(self, done, total, counts, t0):
+        self.draw(done, total, counts, t0)
+
+    def close(self):
+        self.ui.cursor(True)
+
+
+def live_run(ui, tasks, work, workers, view):
+    """Run work(task) for every task in parallel, feeding results to a live
+    view. Ctrl+C stops the run and keeps what was collected so far.
+    Returns (results, counts, elapsed)."""
+    total = len(tasks)
+    results, counts = {}, {}
+    done, last, aborted = 0, 0.0, False
+    t0 = time.time()
+    with NoEcho() if ui.ansi else _null():
+        it = run_parallel(tasks, work, workers)
+        view.open()
+        try:
+            for item in it:
+                urgent = False
+                if item is not None:
+                    task, res = item
+                    results[task] = res
+                    done += 1
+                    counts[res[0]] = counts.get(res[0], 0) + 1
+                    urgent = view.result(task, res)
+                now = time.time()
+                if urgent or done == total or now - last >= 0.1:
+                    view.draw(done, total, counts, t0)
+                    last = now
+        except KeyboardInterrupt:
+            aborted = True
+        finally:
+            it.close()
+            view.finish(done, total, counts, t0)
+            view.close()
+    if aborted:
+        ui.info("aborted after %d/%d" % (done, total))
+    return results, counts, time.time() - t0
+
+
+class _null(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+# --------------------------------------------------------------------------
+# interactive mode: screens
+# --------------------------------------------------------------------------
+
+MENU_ITEMS = (("Enter", "ARP hosts", "pick a neighbour and scan its ports"),
+              ("p", "ping sweep", "ping every address of a network"),
+              ("t", "TCP sweep", "port(s) of your choice on every address"),
+              ("m", "manual host", "type a host and scan its ports"))
+
+
+def menu_screen(ui, opts):
+    """Main menu lines: logo, live gateway dashboard, menu entries."""
+    out = [""]
+    for i, l in enumerate(LOGO):
+        out.append("  " + ui.c(l, THEME["logo"][i % len(THEME["logo"])]))
+    out.append("  " + ui.help("NSG troubleshooting toolkit") + "  "
+               + ui.t("v" + __version__, "title") + "  "
+               + ui.help("Netskope Smart Gateway (ex Infiot)"))
+    out.append("")
+    nets = local_networks()
+    shown = ["%s %s" % (ui.help(dev), ui.t("%s/%d" % (ip, net.prefixlen) if ip
+                                           else str(net), "ip"))
+             for dev, ip, net in nets[:4]]
+    if len(nets) > 4:
+        shown.append(ui.help("+%d more" % (len(nets) - 4)))
+    neigh = arp_hosts()
+    rows = ["   ".join(shown) or ui.help("no IPv4 network found"),
+            "%s %s   %s %s   %s %s   %s %s" % (
+                ui.help("ARP neighbours"), ui.t(str(len(neigh)), "ip"),
+                ui.help("timeout"), ui.t("%.1fs" % opts.timeout, "data"),
+                ui.help("workers"), ui.t(str(opts.workers), "data"),
+                ui.help("banner"), ui.t("on" if opts.banner else "off", "data"))]
+    for l in ui.box(socket.gethostname(), rows, time.strftime("%H:%M:%S"),
+                    width=66):
+        out.append("  " + l)
+    out.append("")
+    for k, label, desc in MENU_ITEMS:
+        out.append("   %s %s %s" % (ui.t(("[%s]" % k).ljust(8), "key"),
+                                    ui.t(label.ljust(12), "ip"), ui.help(desc)))
+    out.append("   %s %s" % (ui.t("Ctrl+C".ljust(8), "key"), ui.help("exit")))
+    out.append("")
+    return out
+
+
+def menu_choice(ui, opts):
+    """Show the main menu and return the key pressed. On a terminal the
+    dashboard refreshes every MENU_REFRESH seconds until a key arrives."""
+    if not ui.ansi:
+        for l in menu_screen(ui, opts):
+            print(l)
+        return getkey("> ").lower()
+    ui.clear()
     while True:
-        h = input("Host (IP or name, Enter=back): ").strip()
+        lines = menu_screen(ui, opts)
+        sys.stdout.write("\033[H" + "".join(l + "\033[K\n" for l in lines)
+                         + "\033[J" + ui.t(" > ", "prompt"))
+        sys.stdout.flush()
+        k = getkey(timeout=MENU_REFRESH)
+        if k is not None:
+            return k.lower()
+
+
+def manual_host(ui):
+    while True:
+        h = ui.ask("Host", "IP or name, Enter back")
         if not h:
             return None
         try:
             ip = socket.gethostbyname(h)
         except (socket.gaierror, UnicodeError) as e:
-            print("  name resolution failed: %s" % e)
+            print(ui.st("  name resolution failed: %s" % e, "error"))
             continue
         return ip, (ip if h == ip else "%s (%s)" % (h, ip))
 
 
-def pick_from_arp():
+def _arp_state_style(s):
+    return {"REACHABLE": "alive", "PERMANENT": "alive",
+            "STALE": "closed", "DELAY": "closed", "PROBE": "closed"}.get(s, "help")
+
+
+def pick_from_arp(ui):
+    ui.section("ARP hosts")
     while True:
         hosts = arp_hosts()
-        print()
         if hosts:
-            print("  %3s  %-15s  %-19s  %-10s  %s"
-                  % ("#", "IP", "(MAC)", "IFACE", "STATE"))
-            for i, (ip, mac, dev, st) in enumerate(hosts, 1):
-                print("  %3d  %-15s  %-19s  %-10s  %s"
-                      % (i, ip, "(%s)" % mac, dev, st))
-            hint = "Select host [1-%d], r=refresh, m=manual, Enter=back: " % len(hosts)
+            rows = [[("%d" % i, "key"), (ip, "ip"), ("(%s)" % mac, "mac"),
+                     (dev, "data"), (st or "-", _arp_state_style(st))]
+                    for i, (ip, mac, dev, st) in enumerate(hosts, 1)]
+            body = ui.table(["#", "IP", "MAC", "IFACE", "STATE"], rows)
         else:
-            print("  ARP table is empty (only hosts this system talked to "
-                  "recently are listed).")
-            hint = "r=refresh, m=manual, Enter=back: "
-        s = input(hint).strip().lower()
+            body = [ui.help("ARP table is empty: only hosts this gateway "
+                            "talked to recently are listed."),
+                    ui.help("Use the ping sweep [p] from the menu to fill it.")]
+        for l in ui.box("ARP neighbours (%d)" % len(hosts), body,
+                        time.strftime("%H:%M:%S")):
+            print(" " + l)
+        hint = ("1-%d, " % len(hosts) if hosts else "") + "r refresh, m manual, Enter back"
+        s = ui.ask("Select host", hint).lower()
         if not s:
             return None
         if s == "r":
+            ui.section("ARP hosts")
             continue
         if s == "m":
-            target = manual_host()
+            target = manual_host(ui)
             if target:
                 return target
             continue
         if s.isdigit() and 1 <= int(s) <= len(hosts):
             ip, mac = hosts[int(s) - 1][:2]
             return ip, "%s (%s)" % (ip, mac)
-        print("  invalid choice")
+        print(ui.st("  invalid choice", "error"))
 
 
-def live_run(tasks, work, workers, order, show, fmt, ansi):
-    """Run work(task) for every task in parallel and print fmt(task, result)
-    as results arrive (only states in `show`; all when None), under a live
-    progress line with per-state counters. Ctrl+C stops the run and returns
-    what was collected so far. Returns (results, counts, elapsed)."""
-    total = len(tasks)
-    results, counts = {}, {}
-    done, last, shown, aborted = 0, 0.0, False, False
-    t0 = time.time()
-    it = run_parallel(tasks, work, workers)
-    try:
-        for item in it:
-            printed = False
-            if item is not None:
-                task, res = item
-                results[task] = res
-                done += 1
-                counts[res[0]] = counts.get(res[0], 0) + 1
-                if show is None or res[0] in show:
-                    if shown:
-                        sys.stdout.write("\r\033[K")
-                    print(fmt(task, res))
-                    printed = True
-            now = time.time()
-            if ansi and (printed or done == total or now - last >= 0.1):
-                sys.stdout.write("\r\033[K"
-                                 + status_text(done, total, counts, t0, order))
-                sys.stdout.flush()
-                shown, last = True, now
-    except KeyboardInterrupt:
-        aborted = True
-    finally:
-        it.close()
-    if shown:
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
-    if aborted:
-        print("# aborted after %d/%d" % (done, total))
-    return results, counts, time.time() - t0
-
-
-def live_scan(ip, label, ports, proto, opts, ansi, color):
+def live_scan(ui, ip, label, ports, proto, opts):
     """Port scan of one host with live output. Ctrl+C stops the scan."""
     total = len(ports)
     show_all = total <= LIVE_ALL_MAX
-    print("# target %s | %s | %d port(s) | timeout %.1fs | Ctrl+C stops the scan"
-          % (label, proto.upper(), total, opts.timeout))
+    ui.info("target %s | %s | %d port(s) | timeout %.1fs | Ctrl+C stops the scan"
+            % (label, proto.upper(), total, opts.timeout))
     if not show_all:
-        print("# more than %d ports: only open ports are listed live, "
-              "every state is counted" % LIVE_ALL_MAX)
+        ui.info("more than %d ports: only open ports are listed live, every "
+                "state is counted" % LIVE_ALL_MAX)
     if proto == "tcp":
         work = lambda p: scan_tcp(ip, p, opts.timeout, opts.banner)
     else:
         work = lambda p: scan_udp(ip, p, opts.timeout)
-    res, counts, el = live_run(
-        ports, work, opts.workers, STATE_ORDER,
-        None if show_all else ("open",),
-        lambda p, r: fmt_line(p, proto, r[0], r[1], r[2], color), ansi)
-    print("# %d/%d scanned | %s | %.2fs"
-          % (len(res), total, fmt_counts(counts), el))
+    view = ScrollView(ui, None if show_all else ("open",),
+                      lambda p, r: fmt_line(p, proto, r[0], r[1], r[2], ui),
+                      STATE_ORDER)
+    res, counts, el = live_run(ui, ports, work, opts.workers, view)
+    print(ui.help("# %d/%d scanned | " % (len(res), total))
+          + ", ".join(ui.st("%s %d" % (s, counts[s]), s)
+                      for s in STATE_ORDER if counts.get(s))
+          + ui.help(" | %.2fs" % el))
     opened = sorted(p for p, r in res.items() if r[0] == "open")
     if opened and not show_all:
-        print("# open: %s" % ",".join(str(p) for p in opened))
+        print(ui.help("# open: ") + ui.st(",".join(map(str, opened)), "open"))
 
 
-def ask_ports(st, key):
+def ask_ports(ui, st, key):
     """Prompt for a port spec (default: last one used), returns the list."""
     while True:
-        spec = input("Ports [%s]: " % st[key]).strip() or st[key]
+        spec = ui.ask("Ports", "Enter = %s" % st[key]) or st[key]
         try:
             ports = parse_ports(spec)
         except ValueError:
@@ -488,27 +929,29 @@ def ask_ports(st, key):
         if ports:
             st[key] = spec
             return ports
-        print("  invalid ports (examples: 502 | 80,443 | 1-1024)")
+        print(ui.st("  invalid ports (examples: 502 | 80,443 | 1-1024)",
+                    "error"))
 
 
-def scan_loop(target, opts, st, ansi, color):
+def scan_loop(ui, target, opts, st):
     ip, label = target
     while True:
-        print()
-        print("Target: %s" % label)
-        ports = ask_ports(st, "ports")
-        k = getkey("Protocol [t]cp / [u]dp (Enter = %s): " % st["proto"]).lower()
+        ui.section("port scan")
+        for l in ui.box("target", [ui.t(label, "ip")]):
+            print(" " + l)
+        ports = ask_ports(ui, st, "ports")
+        k = ui.key("Protocol", "t tcp, u udp, Enter = %s" % st["proto"])
         if k in ("t", "u"):
             st["proto"] = "tcp" if k == "t" else "udp"
-        live_scan(ip, label, ports, st["proto"], opts, ansi, color)
         print()
-        k = getkey("[Enter] new scan on this host   [b] back to the menu   "
-                   "(Ctrl+C exit): ").lower()
+        live_scan(ui, ip, label, ports, st["proto"], opts)
+        print()
+        k = ui.key("Next", "Enter new scan on this host, b back to the menu")
         if k in ("b", "l"):
             return
 
 
-# -- checks on all hosts of a network --------------------------------------
+# -- sweeps: checks on every address of a network ---------------------------
 
 def host_count(net):
     return net.num_addresses - (2 if net.prefixlen < 31 else 0)
@@ -518,87 +961,97 @@ def net_targets(net, own_ip):
     return [str(h) for h in net.hosts() if str(h) != own_ip]
 
 
-def confirm_big(probes, opts):
+def confirm_big(ui, probes, opts):
     """Ask before a long run: more than CONFIRM_ABOVE probes."""
     if probes <= CONFIRM_ABOVE:
         return True
     worst = -(-probes // max(1, opts.workers)) * opts.timeout
-    return getkey("%d probes (worst case ~%ds), continue? [y/N]: "
-                  % (probes, worst)).lower() == "y"
+    return ui.key("%d probes, worst case ~%ds. Continue" % (probes, worst),
+                  "y/N") == "y"
 
 
-def mac_of(ip):
-    return proc_arp().get(ip, ("", ""))[1]
-
-
-def pick_network():
+def pick_network(ui, title):
     """Choose a directly connected network, or type one in CIDR notation.
-    Returns (network, own_ip) or None."""
+    Returns (dev, network, own_ip) or None."""
+    ui.section(title)
     while True:
         nets = local_networks()
-        print()
         if nets:
-            print("  %3s  %-12s  %-18s  %s" % ("#", "IFACE", "NETWORK", "HOSTS"))
-            for i, (dev, ip, net) in enumerate(nets, 1):
-                print("  %3d  %-12s  %-18s  %-6d%s"
-                      % (i, dev, net, host_count(net),
-                         "  this host: %s" % ip if ip else ""))
-            hint = ("Select network [1-%d], c=custom CIDR, Enter=back: "
-                    % len(nets))
+            rows = [[("%d" % i, "key"), (dev, "data"), (str(net), "ip"),
+                     ("%d" % host_count(net), "data"), (ip or "-", "help")]
+                    for i, (dev, ip, net) in enumerate(nets, 1)]
+            body = ui.table(["#", "IFACE", "NETWORK", "HOSTS", "THIS GATEWAY"],
+                            rows)
         else:
-            print("  No directly connected IPv4 network found.")
-            hint = "c=custom CIDR, Enter=back: "
-        s = input(hint).strip().lower()
+            body = [ui.help("No directly connected IPv4 network found.")]
+        for l in ui.box("Networks", body):
+            print(" " + l)
+        hint = ("1-%d, " % len(nets) if nets else "") + "c custom CIDR, Enter back"
+        s = ui.ask("Select network", hint).lower()
         if not s:
             return None
+        dev = ""
         if s == "c":
             try:
                 net = ipaddress.ip_network(
-                    input("Network (e.g. 192.168.55.0/24): ").strip(),
-                    strict=False)
+                    ui.ask("Network", "e.g. 192.168.55.0/24"), strict=False)
             except ValueError:
-                print("  invalid network")
+                print(ui.st("  invalid network", "error"))
                 continue
             own = ""
         elif s.isdigit() and 1 <= int(s) <= len(nets):
-            _, own, net = nets[int(s) - 1]
+            dev, own, net = nets[int(s) - 1]
         else:
-            print("  invalid choice")
+            print(ui.st("  invalid choice", "error"))
             continue
         if net.version != 4:
-            print("  only IPv4 networks are supported")
+            print(ui.st("  only IPv4 networks are supported", "error"))
         elif net.prefixlen < MIN_PREFIX:
-            print("  %s is too large (maximum /%d)" % (net, MIN_PREFIX))
+            print(ui.st("  %s is too large (maximum /%d)" % (net, MIN_PREFIX),
+                        "error"))
         else:
-            return net, own
+            return dev, net, own
 
 
-def ping_all(net, own, opts, ansi, color):
+def _found_line(ui, ip, state, text):
+    mac = mac_of(ip)
+    return "%s %s %s%s" % (ui.st(ui.g["dot"], state), ui.t(ip.ljust(15), "ip"),
+                           text, "  " + ui.t("(%s)" % mac, "mac") if mac else "")
+
+
+def ping_sweep(ui, dev, net, own, opts):
     """Ping every address of `net`; returns rows for pick_result(),
     None if cancelled."""
     base = ping_cmd()
     if base is None:
-        print("  the ping command is not available on this system")
+        print(ui.st("  the ping command is not available on this system",
+                    "error"))
+        ui.pause()
         return None
     targets = net_targets(net, own)
     if not targets:
         return []
-    if not confirm_big(len(targets), opts):
+    if not confirm_big(ui, len(targets), opts):
         return None
     wait = max(1, int(round(opts.timeout)))
-    print("# ping %s | %d address(es) | timeout %ds | Ctrl+C stops"
-          % (net, len(targets), wait))
-
-    def fmt(ip, r):
-        mac = mac_of(ip)
-        return ("  %-15s  %s  %6.1f ms  %s" % (
-            ip, paint("alive", "alive", color), r[1],
-            "(%s)" % mac if mac else "")).rstrip()
-
-    res, counts, el = live_run(targets, lambda ip: ping_host(ip, wait, base),
-                               opts.workers, PING_ORDER, ("alive",), fmt, ansi)
-    print("# %d/%d pinged | %s | %.2fs"
-          % (len(res), len(targets), fmt_counts(counts, PING_ORDER), el))
+    ui.info("ping %s | %d address(es) | timeout %ds | Ctrl+C stops"
+            % (net, len(targets), wait))
+    if ui.ansi and GridView.fits(net):
+        view = GridView(ui, "ping %s" % net, dev, net, own, lambda ip: ip,
+                        PING_ORDER,
+                        [("alive", "alive"), ("no reply", "no reply"),
+                         ("pending", "pending"), ("self", "this gateway")],
+                        ("alive",),
+                        lambda ip, r: _found_line(ui, ip, "alive", ui.t(
+                            "%6.1f ms" % r[1], "data")))
+    else:
+        view = ScrollView(ui, ("alive",), lambda ip, r: "  " + _found_line(
+            ui, ip, "alive", ui.t("%6.1f ms" % r[1], "data")), PING_ORDER)
+    res, counts, el = live_run(ui, targets,
+                               lambda ip: ping_host(ip, wait, base),
+                               opts.workers, view)
+    ui.info("%d/%d pinged | %s | %.2fs"
+            % (len(res), len(targets), fmt_counts(counts, PING_ORDER), el))
     # hosts that resolved ARP but did not answer ping (ICMP blocked)
     neigh = {h[0]: h for h in arp_hosts()
              if ipaddress.ip_address(h[0]) in net}
@@ -608,16 +1061,14 @@ def ping_all(net, own, opts, ansi, color):
         mac = neigh[ip][1] if ip in neigh else mac_of(ip)
         if ip in alive:
             rows.append((ip, mac, "alive", "%.1f ms" % res[ip][1]))
-        elif ip in res:
-            rows.append((ip, mac, "arp-only", "no ping reply, ARP %s"
-                         % (neigh[ip][3] or "entry present")))
         else:
-            rows.append((ip, mac, "arp-only", "not pinged, ARP %s"
-                         % (neigh[ip][3] or "entry present")))
+            rows.append((ip, mac, "arp-only", "%s, ARP %s" % (
+                "no ping reply" if ip in res else "not pinged",
+                neigh[ip][3] or "entry present")))
     arp_only = sum(1 for r in rows if r[2] == "arp-only")
     if arp_only:
-        print("# %d more host(s) in the ARP table without a ping reply "
-              "(ICMP blocked?)" % arp_only)
+        ui.info("%d more host(s) in the ARP table without a ping reply "
+                "(ICMP blocked?)" % arp_only)
     return rows
 
 
@@ -626,32 +1077,38 @@ def _ports_text(ports):
     return ",".join(map(str, ports)) if len(ports) <= 10 else "%d ports" % len(ports)
 
 
-def tcp_all(net, own, opts, ansi, color, st):
+def tcp_sweep(ui, dev, net, own, opts, st):
     """TCP connect to the chosen port(s) on every address of `net`;
     returns rows for pick_result(), None if cancelled."""
     targets = net_targets(net, own)
     if not targets:
         return []
-    ports = ask_ports(st, "net_ports")
+    ports = ask_ports(ui, st, "net_ports")
     tasks = [(ip, p) for ip in targets for p in ports]
-    if not confirm_big(len(tasks), opts):
+    if not confirm_big(ui, len(tasks), opts):
         return None
     live = ("open", "closed") if len(ports) <= 3 else ("open",)
-    print("# TCP %s on %s | %d address(es), %d probe(s) | timeout %.1fs | "
-          "Ctrl+C stops" % (st["net_ports"], net, len(targets), len(tasks),
-                           opts.timeout))
-    print("# listed live: %s (closed = host up, port refused); filtered "
-          "and error are only counted" % " and ".join(live))
-
-    def fmt(t, r):
-        mac = mac_of(t[0])
-        return "  %-15s %s%s" % (t[0], fmt_line(t[1], "tcp", r[0], r[1], r[2],
-                                                color),
-                                 "  (%s)" % mac if mac else "")
-
+    ui.info("TCP %s on %s | %d address(es), %d probe(s) | timeout %.1fs | "
+            "Ctrl+C stops" % (st["net_ports"], net, len(targets), len(tasks),
+                              opts.timeout))
+    fmt_found = lambda t, r: _found_line(
+        ui, t[0], r[0], "%s %s" % (ui.t("%5d/tcp" % t[1], "ip"),
+                                   ui.st("%-6s" % r[0], r[0])))
+    if ui.ansi and GridView.fits(net):
+        view = GridView(ui, "TCP %s on %s" % (st["net_ports"], net), dev, net,
+                        own, lambda t: t[0], STATE_ORDER,
+                        [("open", "open"), ("closed", "closed: host up"),
+                         ("filtered", "no answer"), ("pending", "pending"),
+                         ("self", "this gateway")],
+                        live, fmt_found)
+    else:
+        ui.info("listed live: %s (closed = host up, port refused); filtered "
+                "and error are only counted" % " and ".join(live))
+        view = ScrollView(ui, live, lambda t, r: "  " + fmt_found(t, r),
+                          STATE_ORDER)
     res, counts, el = live_run(
-        tasks, lambda t: scan_tcp(t[0], t[1], opts.timeout, opts.banner),
-        opts.workers, STATE_ORDER, live, fmt, ansi)
+        ui, tasks, lambda t: scan_tcp(t[0], t[1], opts.timeout, opts.banner),
+        opts.workers, view)
     per_host = {}
     for (ip, p), r in res.items():
         per_host.setdefault(ip, {}).setdefault(r[0], []).append(p)
@@ -665,83 +1122,75 @@ def tcp_all(net, own, opts, ansi, color, st):
                  for k in ("open", "closed") if k in s]
         rows.append((ip, neigh.get(ip) or mac_of(ip),
                      "open" if "open" in s else "closed", "; ".join(parts)))
-    print("# %d/%d probes | %s | %.2fs"
-          % (len(res), len(tasks), fmt_counts(counts), el))
-    print("# %d host(s) with open port(s), %d up with the port(s) closed"
-          % (sum(1 for r in rows if r[2] == "open"),
-             sum(1 for r in rows if r[2] == "closed")))
+    ui.info("%d/%d probes | %s | %.2fs"
+            % (len(res), len(tasks), fmt_counts(counts), el))
+    ui.info("%d host(s) with open port(s), %d up with the port(s) closed"
+            % (sum(1 for r in rows if r[2] == "open"),
+               sum(1 for r in rows if r[2] == "closed")))
     return rows
 
 
-def pick_result(rows, color):
-    """Show the hosts found by a check and let the user port-scan one.
-    rows=None means the check was cancelled."""
+def pick_result(ui, rows):
+    """Show the hosts found by a sweep and let the user port-scan one.
+    rows=None means the sweep was cancelled."""
     if rows is None:
         return None
     if not rows:
-        print("  no hosts found")
+        print(ui.help("  no hosts found"))
+        ui.pause()
         return None
     print()
-    print("  %3s  %-15s  %-19s  %-9s  %s"
-          % ("#", "IP", "(MAC)", "RESULT", "DETAILS"))
-    for i, (ip, mac, state, info) in enumerate(rows, 1):
-        print("  %3d  %-15s  %-19s  %s  %s"
-              % (i, ip, "(%s)" % mac if mac else "",
-                 paint("%-9s" % state, state, color), info))
+    body = ui.table(["#", "IP", "MAC", "RESULT", "DETAILS"],
+                    [[("%d" % i, "key"), (ip, "ip"),
+                      ("(%s)" % mac if mac else "", "mac"), (state, state),
+                      (info, "data")]
+                     for i, (ip, mac, state, info) in enumerate(rows, 1)])
+    for l in ui.box("Hosts found (%d)" % len(rows), body):
+        print(" " + l)
     while True:
-        s = input("Port-scan a host [1-%d], Enter=back: " % len(rows)).strip()
+        s = ui.ask("Port-scan a host", "1-%d, Enter back to the menu" % len(rows))
         if not s:
             return None
         if s.isdigit() and 1 <= int(s) <= len(rows):
             ip, mac = rows[int(s) - 1][:2]
             return ip, ("%s (%s)" % (ip, mac) if mac else ip)
-        print("  invalid choice")
-
-
-MAIN_MENU = """\
-  [Enter] hosts in the ARP table: pick one and scan its ports
-  [p]     ping all hosts of a network
-  [t]     TCP port(s) of your choice on all hosts of a network
-  [m]     type a host and scan its ports
-  Ctrl+C  exit"""
+        print(ui.st("  invalid choice", "error"))
 
 
 def interactive(opts):
+    ui = UI.detect(opts.ascii)
     try:
-        __import__("readline")                # line editing for input(), if present
+        __import__("readline")                # line editing for input()
+        ui.readline = True
     except ImportError:
         pass
-    ansi = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
-    color = ansi and "NO_COLOR" not in os.environ
-    title = "nsgscanner %s - interactive mode" % __version__
-    print(("\033[1m%s\033[0m" % title if color else title) + "   (Ctrl+C to exit)")
-    print("# timeout %.1fs | workers %d | banner %s"
-          % (opts.timeout, opts.workers, "on" if opts.banner else "off"))
     st = {"ports": DEFAULT_PORTS, "net_ports": DEFAULT_NET_PORTS,
           "proto": opts.proto}
     try:
         while True:
-            print()
-            print(MAIN_MENU)
-            k = getkey("> ").lower()
+            k = menu_choice(ui, opts)
             if k in ("p", "t"):
-                choice = pick_network()
+                choice = pick_network(ui, "ping sweep" if k == "p"
+                                      else "TCP sweep")
                 if not choice:
                     continue
-                net, own = choice
+                print()
                 if k == "p":
-                    rows = ping_all(net, own, opts, ansi, color)
+                    rows = ping_sweep(ui, choice[0], choice[1], choice[2], opts)
                 else:
-                    rows = tcp_all(net, own, opts, ansi, color, st)
-                target = pick_result(rows, color)
+                    rows = tcp_sweep(ui, choice[0], choice[1], choice[2], opts,
+                                     st)
+                target = pick_result(ui, rows)
             elif k == "m":
-                target = manual_host()
+                ui.section("manual host")
+                target = manual_host(ui)
             else:
-                target = pick_from_arp()
+                target = pick_from_arp(ui)
             if target:
-                scan_loop(target, opts, st, ansi, color)
+                scan_loop(ui, target, opts, st)
     except (KeyboardInterrupt, EOFError):
-        print("\n# bye")
+        ui.cursor(True)
+        print("\n" + ui.help("# bye"))
         sys.stdout.flush()
         os._exit(0)                           # don't wait for probes in flight
 
@@ -756,7 +1205,7 @@ Netskope Smart Gateways (NSG), formerly Infiot.
 
 Two ways to run it:
   nsgscanner <host> <ports> [options]   one-shot scan, results at the end
-  nsgscanner -i [options]               interactive menu with live scan"""
+  nsgscanner -i [options]               interactive menu with live views"""
 
 HELP_EPILOG = """\
 examples:
@@ -766,22 +1215,29 @@ examples:
   nsgscanner 192.168.55.56 53 --proto udp          UDP
   nsgscanner -i                                    interactive menu
   nsgscanner -i --timeout 1 --banner               interactive, options
-                                                   applied to every scan
+                                                   applied to every run
 
 interactive mode (-i / --interactive), main menu:
+  The menu shows a dashboard of the gateway (networks, ARP neighbours,
+  clock) refreshed every 2 seconds.
   [Enter] list the directly connected hosts from the ARP table (ip neigh,
           or /proc/net/arp) as IP (MAC), pick one, choose ports and
           protocol; results appear live with a progress line
-  [p]     ping every address of a network (a connected one, chosen from
-          the gateway interfaces, or any CIDR up to /16); also lists hosts
-          that answer ARP but block ping
-  [t]     TCP check on every address of a network for the port(s) you
-          choose: open = service up, closed = host up but port refused
+  [p]     ping sweep: ping every address of a network (a connected one,
+          chosen from the gateway interfaces, or any CIDR up to /16);
+          also lists hosts that answer ARP but block ping
+  [t]     TCP sweep: the port(s) you choose on every address of a
+          network: open = service up, closed = host up but port refused
   [m]     type a host and scan its ports
+  Sweeps on networks up to /22 show a live map, one cell per address.
   After [p] and [t] you can pick one of the hosts found and scan its ports.
-  Ctrl+C stops a running scan or check; Ctrl+C at the menu exits.
-  The ARP table only lists hosts the gateway talked to recently: [p]
-  fills it with every host that answers on the network.
+  Ctrl+C stops a running scan or sweep; Ctrl+C at the menu exits.
+
+display:
+  Colours on a terminal: scan data is bold/coloured (addresses, states,
+  times), helper text is grey. Colours are off when the output is not a
+  terminal or NO_COLOR is set. Unicode drawing is used on UTF-8 terminals;
+  --ascii (or NSG_ASCII=1) forces plain ASCII.
 
 port states:
   TCP  open           connection accepted
@@ -804,9 +1260,8 @@ def main():
     ap.add_argument("ports", nargs="?",
                     help="single port (502), list (80,443) or range (1-1024)")
     ap.add_argument("-i", "--interactive", action="store_true",
-                    help="interactive menu: pick a host from the ARP table, "
-                         "choose ports/protocol, watch the scan live "
-                         "(Ctrl+C to exit)")
+                    help="interactive menu: ARP hosts, ping sweep, TCP sweep, "
+                         "live views (Ctrl+C to exit)")
     ap.add_argument("--proto", choices=["tcp", "udp"], default="tcp",
                     help="protocol (default: tcp; selectable in the menu "
                          "with -i)")
@@ -818,6 +1273,8 @@ def main():
                     help="TCP: attempt a banner grab on open ports")
     ap.add_argument("--open-only", action="store_true",
                     help="print open ports only (one-shot scan)")
+    ap.add_argument("--ascii", action="store_true",
+                    help="plain ASCII drawing, no Unicode box/block characters")
     ap.add_argument("--version", action="version",
                     version="nsgscanner " + __version__)
     if len(sys.argv) == 1:                   # no arguments: show the full help
@@ -833,6 +1290,7 @@ def main():
     if not args.host or not args.ports:
         ap.error("host and ports are required (or use --interactive)")
 
+    ui = UI.detect(args.ascii)
     try:
         ip = socket.gethostbyname(args.host)
     except socket.gaierror as e:
@@ -847,8 +1305,9 @@ def main():
         print("No valid port in '%s'" % args.ports)
         sys.exit(2)
 
-    print("# target %s (%s) | %s | %d port(s) | timeout %.1fs"
-          % (args.host, ip, args.proto.upper(), len(ports), args.timeout))
+    print(ui.help("# target %s (%s) | %s | %d port(s) | timeout %.1fs"
+                  % (args.host, ip, args.proto.upper(), len(ports),
+                     args.timeout)))
 
     t0 = time.time()
     results = {}
@@ -858,7 +1317,7 @@ def main():
             if item is not None:
                 results[item[0]] = item[1]
     except KeyboardInterrupt:
-        print("\n# aborted")
+        print("\n" + ui.help("# aborted"))
         sys.stdout.flush()
         os._exit(130)       # exit now, don't wait for in-flight probes
 
@@ -869,10 +1328,14 @@ def main():
         openc += is_open
         if args.open_only and not is_open:
             continue
-        print(fmt_line(p, args.proto, state, rtt, extra))
-    print("# %d open (or open|filtered) of %d | %.2fs"
-          % (openc, len(ports), time.time() - t0))
+        print(fmt_line(p, args.proto, state, rtt, extra, ui))
+    print(ui.help("# %d open (or open|filtered) of %d | %.2fs"
+                  % (openc, len(ports), time.time() - t0)))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:                  # output piped into head & co.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
